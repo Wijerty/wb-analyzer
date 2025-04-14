@@ -1,0 +1,19 @@
+# Основные пакеты
+Flask==2.0.1
+Flask-Cors==3.0.10
+Werkzeug==2.0.1
+numpy>=1.19.0
+Pillow>=9.0.1
+matplotlib>=3.5.1
+scipy>=1.7.0
+uuid==1.30
+python-dotenv==0.19.2
+
+# Для работы с видео
+opencv-python>=4.5.5.64
+opencv-python-headless>=4.5.5.64
+
+# Для модели машинного обучения
+torch>=1.10.0
+torchvision>=0.11.0
+tqdm==4.62.3

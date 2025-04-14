@@ -1,0 +1,432 @@
+@app.route('/api/results/<result_id>', methods=['GET'])
+def get_result(result_id):
+    """Получение результата анализа по ID."""
+    logger.info(f"Request for result with ID: {result_id}")
+    try:
+        # Специальная обработка для 'latest' - возвращаем самый последний результат
+        if result_id == 'latest':
+            logger.info("Processing 'latest' request - finding most recent result")
+            # Получаем список всех директорий с результатами
+            result_dirs = [d for d in os.listdir(RESULTS_FOLDER) if os.path.isdir(os.path.join(RESULTS_FOLDER, d))]
+            
+            if not result_dirs:
+                logger.warning("No analysis results found in folder")
+                return jsonify({'error': 'Результаты анализа не найдены'}), 404
+                
+            # Сортируем по времени модификации (самый новый сначала)
+            try:
+                result_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(RESULTS_FOLDER, d)), reverse=True)
+                latest_id = result_dirs[0]
+                logger.info(f"Latest result found: {latest_id}")
+                
+                # Перенаправляем запрос на конкретный ID
+                result = get_result(latest_id)
+                # Добавляем реальный ID анализа в ответ
+                if hasattr(result, 'json'):
+                    data = result.json
+                    if isinstance(data, dict):
+                        data['analysisId'] = latest_id
+                        result.set_data(jsonify(data).get_data())
+                return result
+            except Exception as e:
+                logger.error(f"Error finding latest result: {str(e)}")
+                return jsonify({'error': 'Ошибка при поиске последнего результата'}), 500
+        
+        # Проверяем, есть ли результат в кэше
+        if result_id in analysis_results:
+            logger.info(f"Result {result_id} found in cache")
+            result_data = analysis_results[result_id]
+            # Добавляем ID анализа в ответ, если он отсутствует
+            if 'analysisId' not in result_data:
+                result_data['analysisId'] = result_id
+            response = jsonify(result_data)
+            # Добавляем CORS заголовки
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            return response
+        
+        # Пути к возможным директориям с результатами
+        possible_paths = [
+            os.path.join(RESULTS_FOLDER, result_id, 'result.json'),
+            os.path.join('results', result_id, 'result.json'),
+            os.path.join('api_results', result_id, 'result.json')
+        ]
+        
+        logger.info(f"Looking for result in possible paths: {possible_paths}")
+        
+        # Проверяем все возможные пути
+        result_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                result_path = path
+                logger.info(f"Result file found at {result_path}")
+                break
+        
+        if result_path:
+            try:
+                with open(result_path, 'r') as f:
+                    result = json.load(f)
+                    # Проверяем структуру данных
+                    if not isinstance(result, dict) or 'results' not in result:
+                        logger.error(f"Invalid result format in {result_path}")
+                        return jsonify({'error': 'Формат результата некорректен'}), 500
+                    
+                    # Добавляем ID анализа в результат
+                    if 'analysisId' not in result:
+                        result['analysisId'] = result_id
+                    
+                    # Кэшируем результат
+                    analysis_results[result_id] = result
+                    response = jsonify(result)
+                    # Добавляем CORS заголовки
+                    response.headers['Access-Control-Allow-Origin'] = '*'
+                    response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+                    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                    return response
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error in {result_path}: {str(e)}")
+                return jsonify({'error': f'Ошибка при чтении файла результата: {str(e)}'}), 500
+            except Exception as e:
+                logger.error(f"Error loading result from {result_path}: {str(e)}")
+                logger.error(traceback.format_exc())
+                return jsonify({'error': f'Ошибка при загрузке результата: {str(e)}'}), 500
+        
+        # Проверяем наличие директорий с результатами
+        possible_dirs = [
+            os.path.join(RESULTS_FOLDER, result_id),
+            os.path.join('results', result_id),
+            os.path.join('api_results', result_id)
+        ]
+        
+        logger.info(f"Looking for result directories: {possible_dirs}")
+        
+        # Проверяем все возможные директории
+        existing_dirs = [d for d in possible_dirs if os.path.exists(d) and os.path.isdir(d)]
+        if existing_dirs:
+            for dir_path in existing_dirs:
+                logger.info(f"Checking directory {dir_path} for any result files")
+                files = os.listdir(dir_path)
+                logger.info(f"Files in directory: {files}")
+            
+            return jsonify({'error': 'Результат найден, но его файл поврежден или отсутствует'}), 500
+        
+        logger.warning(f"Result {result_id} not found in any location")
+        response = jsonify({'error': 'Результат не найден'})
+        # Добавляем CORS заголовки
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response, 404
+    except Exception as e:
+        logger.error(f"Unhandled exception in get_result for {result_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        response = jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'})
+        # Добавляем CORS заголовки
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response, 500
+
+@app.route('/api/results', methods=['GET'])
+def get_results():
+    """Получение списка всех результатов анализа."""
+    page = int(request.args.get('page', 1))
+    limit = int(request.args.get('limit', 10))
+    
+    # Получаем список всех директорий с результатами
+    result_dirs = [d for d in os.listdir(RESULTS_FOLDER) if os.path.isdir(os.path.join(RESULTS_FOLDER, d))]
+    result_dirs.sort(reverse=True)  # Сортируем по убыванию (новые результаты сначала)
+    
+    # Пагинация
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_dirs = result_dirs[start_idx:end_idx]
+    
+    # Загружаем результаты
+    results = []
+    for dir_name in paginated_dirs:
+        result_path = os.path.join(RESULTS_FOLDER, dir_name, 'result.json')
+        if os.path.exists(result_path):
+            try:
+                with open(result_path, 'r') as f:
+                    result = json.load(f)
+                    results.append(result)
+            except Exception as e:
+                print(f"Ошибка при загрузке результата {dir_name}: {str(e)}")
+    
+    return jsonify({
+        'results': results,
+        'total': len(result_dirs)
+    })
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    try:
+        results_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULTS_FOLDER)
+        
+        # Добавляем логирование для диагностики
+        print(f"Запрос к статическому файлу: {filename}")
+        print(f"Папка results: {results_folder}")
+        full_path = os.path.join(results_folder, filename)
+        print(f"Полный путь: {full_path}")
+        
+        if not os.path.exists(full_path):
+            print(f"Ошибка: Файл не найден: {full_path}")
+            # Проверяем, может быть файл в другой директории
+            alternative_paths = [
+                os.path.join('results', filename),
+                os.path.join('api_results', filename),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results', filename),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_results', filename)
+            ]
+            
+            for alt_path in alternative_paths:
+                print(f"Проверяем альтернативный путь: {alt_path}")
+                if os.path.exists(alt_path):
+                    print(f"Найден файл по альтернативному пути: {alt_path}")
+                    full_path = alt_path
+                    break
+            
+            # Если файл все равно не найден
+            if not os.path.exists(full_path):
+                print(f"Файл не найден ни по одному из путей")
+                
+                # Проверяем, является ли filename путем с вложенными директориями
+                parts = filename.split('/')
+                if len(parts) >= 3:  # Например: analysis_id/product_id/file.mp4
+                    # Пробуем найти файлы в директории
+                    try:
+                        base_dir = os.path.join(results_folder, parts[0], parts[1])
+                        print(f"Проверяем базовую директорию: {base_dir}")
+                        
+                        if os.path.exists(base_dir) and os.path.isdir(base_dir):
+                            # Смотрим все файлы с нужным расширением
+                            extensions = ['.mp4', '.avi', '.webm', '.jpg', '.jpeg', '.png']
+                            for root, dirs, files in os.walk(base_dir):
+                                for file in files:
+                                    if any(file.endswith(ext) for ext in extensions):
+                                        full_path = os.path.join(root, file)
+                                        print(f"Найден подходящий файл: {full_path}")
+                                        break
+                                if os.path.exists(full_path):
+                                    break
+                        
+                        if os.path.exists(full_path):
+                            print(f"Используем найденный файл: {full_path}")
+                        else:
+                            print(f"Подходящие файлы не найдены в {base_dir}")
+                            return "Файл не найден", 404
+                    except Exception as e:
+                        print(f"Ошибка при поиске файлов в поддиректориях: {str(e)}")
+                        return "Файл не найден", 404
+                else:
+                    return "Файл не найден", 404
+            
+        if not os.path.isfile(full_path):
+            print(f"Ошибка: Путь не является файлом: {full_path}")
+            return "Некорректный путь", 400
+        
+        # Определение MIME-типа файла
+        mime_type = None
+        if filename.endswith('.mp4'):
+            mime_type = 'video/mp4'
+        elif filename.endswith('.avi'):
+            mime_type = 'video/x-msvideo'
+        elif filename.endswith('.webm'):
+            mime_type = 'video/webm'
+        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+            mime_type = 'image/jpeg'
+        elif filename.endswith('.png'):
+            mime_type = 'image/png'
+        else:
+            # Определяем тип по расширению файла
+            _, ext = os.path.splitext(full_path)
+            if ext.lower() == '.mp4':
+                mime_type = 'video/mp4'
+            elif ext.lower() == '.avi':
+                mime_type = 'video/x-msvideo'
+            elif ext.lower() == '.webm':
+                mime_type = 'video/webm'
+            elif ext.lower() in ['.jpg', '.jpeg']:
+                mime_type = 'image/jpeg'
+            elif ext.lower() == '.png':
+                mime_type = 'image/png'
+            else:
+                # Если не удалось определить, используем общий бинарный тип
+                mime_type = 'application/octet-stream'
+        
+        print(f"Отправка файла: {full_path} с MIME-типом: {mime_type}")
+        
+        # Отправляем файл с CORS заголовками
+        response = send_file(full_path, mimetype=mime_type)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
+        
+    except Exception as e:
+        print(f"Ошибка при обработке статического файла: {str(e)}")
+        print(traceback.format_exc())
+        return f"Ошибка сервера: {str(e)}", 500
+
+@app.route('/video/<path:video_id>')
+def serve_video(video_id):
+    try:
+        print(f"[serve_video] Serving video for ID: {video_id}")
+        
+        # Check for possible locations
+        possible_folders = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results'),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_results'),
+            os.path.join('results'),
+            os.path.join('api_results'),
+            RESULTS_FOLDER
+        ]
+        
+        video_folder = None
+        
+        # Try each possible folder location
+        for folder in possible_folders:
+            potential_folder = os.path.join(folder, video_id)
+            print(f"[serve_video] Checking for folder: {potential_folder}")
+            if os.path.exists(potential_folder) and os.path.isdir(potential_folder):
+                video_folder = potential_folder
+                print(f"[serve_video] Found analysis folder: {video_folder}")
+                break
+        
+        if not video_folder:
+            print(f"[serve_video] Analysis folder not found for ID: {video_id}")
+            
+            # Check if this is just a product_id without a parent folder
+            if '/' in video_id:
+                parts = video_id.split('/')
+                analysis_id = parts[0]
+                product_id = parts[1] if len(parts) > 1 else None
+                
+                if analysis_id and product_id:
+                    for folder in possible_folders:
+                        product_folder = os.path.join(folder, analysis_id, product_id)
+                        print(f"[serve_video] Checking for product folder: {product_folder}")
+                        if os.path.exists(product_folder) and os.path.isdir(product_folder):
+                            video_folder = product_folder
+                            print(f"[serve_video] Found product folder: {video_folder}")
+                            break
+            
+            # Если все еще не найдено, пробуем найти через поиск директорий
+            if not video_folder:
+                print(f"[serve_video] Trying to find by searching directories")
+                # Поиск директорий, содержащих video_id
+                matching_folders = []
+                for folder in possible_folders:
+                    if os.path.exists(folder) and os.path.isdir(folder):
+                        for root, dirs, files in os.walk(folder):
+                            for dir_name in dirs:
+                                if video_id in dir_name:
+                                    matching_path = os.path.join(root, dir_name)
+                                    matching_folders.append(matching_path)
+                                    print(f"[serve_video] Found potential matching folder: {matching_path}")
+                
+                # Используем первую найденную директорию
+                if matching_folders:
+                    video_folder = matching_folders[0]
+                    print(f"[serve_video] Using matching folder: {video_folder}")
+            
+            if not video_folder:
+                print(f"[serve_video] Still no folder found, trying direct file lookup")
+                
+                # Проверяем, может видео доступно напрямую через static endpoint
+                path_to_try = f"/static/{video_id}"
+                if "." not in video_id:  # Если нет расширения, добавляем .mp4
+                    path_to_try = f"{path_to_try}.mp4"
+                
+                print(f"[serve_video] Suggesting alternate path: {path_to_try}")
+                response = jsonify({"alternateUrl": path_to_try})
+                response.headers['Access-Control-Allow-Origin'] = '*'
+                response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                return response, 302
+            
+            return "Анализ не найден", 404
+            
+        # Находим видеофайл в папке
+        video_files = []
+        try:
+            video_files = [f for f in os.listdir(video_folder) 
+                          if f.endswith(('.mp4', '.avi', '.webm')) and os.path.isfile(os.path.join(video_folder, f))]
+            print(f"[serve_video] Found video files: {video_files}")
+        except Exception as e:
+            print(f"[serve_video] Error listing directory: {str(e)}")
+            return f"Ошибка при поиске видео: {str(e)}", 500
+        
+        if not video_files:
+            print(f"[serve_video] No video files found in folder {video_folder}")
+            
+            # Look in all subfolders as well
+            for root, dirs, files in os.walk(video_folder):
+                for file in files:
+                    if file.endswith(('.mp4', '.avi', '.webm')):
+                        video_path = os.path.join(root, file)
+                        print(f"[serve_video] Found video in subfolder: {video_path}")
+                        
+                        # Determine MIME-type
+                        mime_type = 'video/mp4'  # Default
+                        if video_path.endswith('.avi'):
+                            mime_type = 'video/x-msvideo'
+                        elif video_path.endswith('.webm'):
+                            mime_type = 'video/webm'
+                        
+                        # Return the first video found
+                        response = send_file(video_path, mimetype=mime_type)
+                        response.headers['Access-Control-Allow-Origin'] = '*'
+                        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+                        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                        return response
+            
+            return "Видеофайл не найден", 404
+            
+        # Используем первый найденный видеофайл
+        video_path = os.path.join(video_folder, video_files[0])
+        
+        # Определяем MIME-тип
+        mime_type = 'video/mp4'  # По умолчанию
+        if video_path.endswith('.avi'):
+            mime_type = 'video/x-msvideo'
+        elif video_path.endswith('.webm'):
+            mime_type = 'video/webm'
+            
+        print(f"[serve_video] Serving video file: {video_path} (Type: {mime_type})")
+        
+        # Отправляем файл с CORS заголовками
+        response = send_file(video_path, mimetype=mime_type)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
+            
+    except Exception as e:
+        print(f"[serve_video] Error serving video: {str(e)}")
+        print(traceback.format_exc())
+        return f"Ошибка сервера: {str(e)}", 500
+
+@app.route('/api/<path:path>', methods=['GET', 'POST', 'OPTIONS'])
+def api_fallback(path):
+    # Выводим информацию о попытке доступа к API
+    print(f"[api_fallback] API request to path: {path}, method: {request.method}")
+    return jsonify({"error": f"API endpoint not found or method not allowed: {path}"}), 404
+
+# Обслуживаем React приложение на основном маршруте
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    # Игнорируем запросы к /api
+    if path.startswith('api/'):
+        return jsonify({"error": "API endpoint not found"}), 404
+        
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)

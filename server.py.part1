@@ -1,0 +1,275 @@
+import os
+import sys
+import json
+import uuid
+import shutil
+import logging
+import traceback
+from typing import Dict, List, Optional, Union, Any
+from datetime import datetime
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('server.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+logger.info("Starting WB Analyzer API server")
+
+# Настройка matplotlib перед импортом модуля ML
+import matplotlib
+matplotlib.use('Agg')  # Не-интерактивный бэкенд без GUI
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from flask import Flask, request, jsonify, send_from_directory, send_file
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+# Импортируем класс модели из существующего скрипта
+# Добавляем корневую директорию проекта к путям поиска модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Импортируем из файла test.py в корневой директории
+from ml.test import ObjectDetector, SSLModel
+
+app = Flask(__name__, static_folder='build')
+CORS(app)  # Разрешаем кросс-доменные запросы
+
+# Добавляем обработчик для CORS preflight запросов
+@app.route('/api/results/<result_id>', methods=['OPTIONS'])
+def options_results(result_id):
+    """Обработчик для CORS preflight запросов."""
+    response = jsonify({})
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
+
+# Конфигурация
+MODEL_PATH = './models/ssl_model_epoch_80.pth'
+UPLOAD_FOLDER = 'uploads'
+RESULTS_FOLDER = 'api_results'
+ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'webm'}
+ALLOWED_IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
+
+# Создаем директории, если они не существуют
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(RESULTS_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_FOLDER, 'videos'), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_FOLDER, 'images'), exist_ok=True)
+
+# Хранилище результатов (в реальном приложении это должна быть БД)
+analysis_results = {}
+
+def allowed_file(filename: str, allowed_extensions: set) -> bool:
+    """Проверяет, допустимо ли расширение файла."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_video():
+    """Обработка запроса на анализ видео."""
+    if 'video' not in request.files:
+        return jsonify({'error': 'Видео не найдено в запросе'}), 400
+    
+    video_file = request.files['video']
+    if not video_file or not allowed_file(video_file.filename, ALLOWED_VIDEO_EXTENSIONS):
+        return jsonify({'error': 'Недопустимый формат видео'}), 400
+    
+    # Сохраняем видео
+    analysis_id = str(uuid.uuid4())
+    os.makedirs(os.path.join(RESULTS_FOLDER, analysis_id), exist_ok=True)
+    
+    video_filename = secure_filename(video_file.filename)
+    video_path = os.path.join(UPLOAD_FOLDER, 'videos', f"{analysis_id}_{video_filename}")
+    video_file.save(video_path)
+    
+    # Получаем параметры анализа
+    threshold = float(request.form.get('threshold', 0.85))
+    sample_rate = int(request.form.get('sample_rate', 10))
+    
+    # Собираем информацию о товарах
+    products = {}
+    
+    # Перебираем все файлы с изображениями товаров
+    for key in request.files:
+        if key.startswith('product_image_'):
+            parts = key.split('_')
+            if len(parts) >= 3:
+                product_index = int(parts[2])
+                image_index = int(parts[3]) if len(parts) >= 4 else 0
+                
+                product_image = request.files[key]
+                if product_image and allowed_file(product_image.filename, ALLOWED_IMAGE_EXTENSIONS):
+                    image_filename = secure_filename(product_image.filename)
+                    product_id = f"product_{product_index}"
+                    
+                    # Создаем директорию для изображений товара
+                    product_images_dir = os.path.join(UPLOAD_FOLDER, 'images', f"{analysis_id}_{product_id}")
+                    os.makedirs(product_images_dir, exist_ok=True)
+                    
+                    # Сохраняем изображение
+                    image_path = os.path.join(product_images_dir, f"image_{image_index}_{image_filename}")
+                    product_image.save(image_path)
+                    
+                    # Добавляем или обновляем информацию о товаре
+                    if product_id not in products:
+                        products[product_id] = {
+                            'id': product_id,
+                            'name': f"Товар {product_index + 1}",
+                            'image_paths': []
+                        }
+                    
+                    products[product_id]['image_paths'].append(image_path)
+    
+    # Преобразуем словарь в список
+    product_list = list(products.values())
+    
+    if not product_list:
+        return jsonify({'error': 'Не найдено изображений товаров для анализа'}), 400
+    
+    try:
+        # Инициализируем детектор объектов
+        detector = ObjectDetector(MODEL_PATH)
+        
+        # Анализируем наличие каждого товара на видео
+        results = []
+        video_duration = 0
+        
+        for product in product_list:
+            # Путь к результатам для этого товара
+            product_result_dir = os.path.join(RESULTS_FOLDER, analysis_id, product['id'])
+            os.makedirs(product_result_dir, exist_ok=True)
+            
+            # Путь к выходному видео (опционально)
+            output_video_path = os.path.join(product_result_dir, f"result_{product['id']}.mp4")
+            
+            # Создаем график для визуализации
+            chart_path = os.path.join(product_result_dir, f"chart_{product['id']}.png")
+            
+            # Анализируем видео для этого товара
+            try:
+                # Анализируем видео для текущего товара с использованием всех изображений
+                frames, similarity_scores, matches = detector.visualize_results(
+                    video_path=video_path,
+                    target_image_path=product['image_paths'],
+                    output_image_path=chart_path,
+                    threshold=threshold,
+                    sample_rate=sample_rate
+                )
+                
+                # Проверяем, найден ли товар
+                # Товар найден, если есть хотя бы одно совпадение выше порога
+                detected = len(matches) > 0
+                
+                # Дополнительная проверка: если объект matches пустой, но есть значения сходства выше порога
+                if not detected and similarity_scores:
+                    max_similarity = max(similarity_scores)
+                    if max_similarity >= threshold:
+                        detected = True
+                        print(f"Товар {product['name']} обнаружен по максимальному значению сходства: {max_similarity}")
+                
+                # Получаем длительность видео, если еще не получили
+                if video_duration == 0:
+                    cap = cv2.VideoCapture(video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video_duration = int(total_frames / fps)
+                    cap.release()
+                
+                # Создаем массив для хранения путей к изображениям товара
+                product_image_urls = []
+                
+                # Копируем все изображения товара в папку результатов
+                for i, img_path in enumerate(product['image_paths']):
+                    dest_path = os.path.join(product_result_dir, f"product_image_{i}.jpg")
+                    image = Image.open(img_path)
+                    image.save(dest_path)
+                    product_image_urls.append(f"/static/{analysis_id}/{product['id']}/product_image_{i}.jpg")
+                
+                # Создаем объект результата анализа
+                product_result = {
+                    'id': product['id'],
+                    'productName': product['name'],
+                    'detected': detected,
+                    'similarity': similarity_scores,
+                    'frames': frames,
+                    'threshold': threshold,
+                    'productImage': product_image_urls[0],  # Первое изображение как основное
+                    'productImages': product_image_urls,    # Все изображения
+                    'videoUrl': f"/static/{analysis_id}/{product['id']}/result_{product['id']}.mp4" if detected else None
+                }
+                
+                results.append(product_result)
+                
+            except Exception as e:
+                # Очищаем ресурсы matplotlib при ошибке
+                import matplotlib.pyplot as plt
+                plt.close('all')
+                
+                print(f"Ошибка при анализе товара {product['name']}: {str(e)}")
+                # Добавляем товар как "не найден" в случае ошибки
+                
+                # Создаем массив для хранения путей к изображениям товара
+                product_image_urls = []
+                
+                # Копируем все изображения товара в папку результатов
+                for i, img_path in enumerate(product['image_paths']):
+                    dest_path = os.path.join(product_result_dir, f"product_image_{i}.jpg")
+                    image = Image.open(img_path)
+                    image.save(dest_path)
+                    product_image_urls.append(f"/static/{analysis_id}/{product['id']}/product_image_{i}.jpg")
+                
+                product_result = {
+                    'id': product['id'],
+                    'productName': product['name'],
+                    'detected': False,
+                    'similarity': [],
+                    'frames': [],
+                    'threshold': threshold,
+                    'productImage': product_image_urls[0],  # Первое изображение как основное
+                    'productImages': product_image_urls,    # Все изображения
+                    'videoUrl': None
+                }
+                
+                results.append(product_result)
+        
+        # Формируем общий результат анализа
+        analysis_summary = {
+            'results': results,
+            'analysisParams': {
+                'threshold': threshold,
+                'sampleRate': sample_rate,
+                'duration': video_duration
+            },
+            'timestamp': datetime.now().isoformat(),
+            'analysisId': analysis_id  # Добавляем ID анализа в результат
+        }
+        
+        # Сохраняем результат в хранилище
+        analysis_results[analysis_id] = analysis_summary
+        
+        # Сохраняем результат в JSON файл
+        with open(os.path.join(RESULTS_FOLDER, analysis_id, 'result.json'), 'w') as f:
+            json.dump(analysis_summary, f)
+        
+        # Очищаем ресурсы matplotlib перед возвратом результата
+        import matplotlib.pyplot as plt
+        plt.close('all')
+        
+        return jsonify(analysis_summary)
+        
+    except Exception as e:
+        # Очищаем ресурсы matplotlib при ошибке
+        import matplotlib.pyplot as plt
+        plt.close('all')
+        
+        print(f"Ошибка при анализе видео: {str(e)}")
+        return jsonify({'error': f'Ошибка при анализе видео: {str(e)}'}), 500
